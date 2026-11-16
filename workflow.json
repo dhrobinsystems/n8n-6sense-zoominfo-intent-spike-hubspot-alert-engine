@@ -1,0 +1,1622 @@
+{
+  "name": "n8n-6sense-zoominfo-intent-spike-hubspot-alert-engine",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "intent-spike",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "4b77ff38-47d7-5cda-8370-25c6305704a2",
+      "name": "Intent Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "00000000-0000-4000-8000-0000000000c7",
+      "notes": "6sense / ZoomInfo intent surges (via a signing relay, or ZoomInfo direct with its verification token). 7 pinned fictional deliveries, 12 accounts."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Verify Signature & Normalize Intent   Mode: Run Once for All Items\n// Repo: n8n-6sense-zoominfo-intent-spike-hubspot-alert-engine · dhRobin Systems\n// Authentication (fails closed):\n//   hmac_sha256     (default) X-Intent-Signature: sha256=HMAC(secret, \"<ts>.<raw body>\")\n//                   with X-Intent-Timestamp inside the replay window. Used by the\n//                   relay that forwards 6sense or ZoomInfo intent to n8n.\n//   zoominfo_token  (opt-in)  ZoomInfo's own webhooks send a static token in\n//                   x-zoominfo-token; compared in constant time.\n// Normalisation: 4 payload shapes → one item per account with a clean domain,\n// tracked topics (0-100), score deltas, buying-stage transition and a surge\n// decision. Cooldown/escalation rules suppress repeat alerts.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst helpers = this.helpers;\nlet crypto = null;\ntry { crypto = require('crypto'); } catch (error) { crypto = null; }\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst PERSIST = !SANDBOX_MODE && !DRY_RUN;\n// Sandbox accepts both methods so the ZoomInfo token fixture runs; live defaults to HMAC only.\nconst AUTH_MODES = new Set(csv('INTENT_AUTH_MODES', SANDBOX_MODE ? 'hmac_sha256,zoominfo_token' : 'hmac_sha256').map((m) => m.toLowerCase()));\nconst SIG_HEADER = env('INTENT_SIGNATURE_HEADER', 'x-intent-signature').toLowerCase();\nconst TS_HEADER = env('INTENT_TIMESTAMP_HEADER', 'x-intent-timestamp').toLowerCase();\nconst TOLERANCE = Math.max(30, num('INTENT_SIGNATURE_TOLERANCE_SECONDS', 300));\nconst SANDBOX_SECRET = 'sandbox-fictional-intent-secret-not-for-production';\nconst SANDBOX_ZI = 'sandbox-fictional-zoominfo-verification-value';\nconst SECRET = env('INTENT_WEBHOOK_SECRET', '') || (SANDBOX_MODE ? SANDBOX_SECRET : '');\nconst ZI_TOKEN = env('ZOOMINFO_WEBHOOK_TOKEN', '') || (SANDBOX_MODE ? SANDBOX_ZI : '');\nconst THRESHOLD = num('INTENT_SCORE_THRESHOLD', 70);\nconst MIN_DELTA = num('MIN_SCORE_DELTA', 15);\nconst TRACKED = csv('TRACKED_TOPICS', '').map((t) => t.toLowerCase());\nconst SURGE_STAGES = csv('SURGE_BUYING_STAGES', 'Decision,Purchase').map((s) => s.toLowerCase());\nconst COOLDOWN_H = Math.max(0, num('ALERT_COOLDOWN_HOURS', 72));\nconst MAX_ACCOUNTS = Math.max(1, num('MAX_ACCOUNTS_PER_DELIVERY', 25));\nconst EXCLUDED = new Set(['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'yahoo.com', 'icloud.com', 'me.com', 'aol.com', 'proton.me', 'protonmail.com', 'gmx.com',\n  ...csv('EXCLUDED_DOMAINS', 'YOUR_COMPANY_DOMAIN.example').map((d) => d.toLowerCase())]);\nconst STAGE_ORDER = ['target', 'awareness', 'consideration', 'decision', 'purchase'];\n\nlet runId;\ntry { runId = 'int_' + crypto.randomUUID(); } catch (error) { runId = 'int_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }\nconst run = { runId, startedAt: new Date().toISOString(), mode: SANDBOX_MODE ? 'sandbox' : DRY_RUN ? 'dry_run' : 'live', sandboxMode: SANDBOX_MODE, dryRun: DRY_RUN };\n\nconst items = $input.all();\nconst sharedFixtures = SANDBOX_MODE ? ((items.find((i) => i.json.sandboxFixtures) || { json: {} }).json.sandboxFixtures || null) : null;\n\nconst sha = (s) => crypto.createHash('sha256').update(String(s)).digest();\nconst safeEqual = (a, b) => !!crypto && typeof a === 'string' && typeof b === 'string' && a.length > 0 && b.length > 0 && crypto.timingSafeEqual(sha(a), sha(b));\n\nfunction authenticate(headers, raw) {\n  if (!crypto) return { ok: false, reason: 'crypto_module_unavailable' };\n  if (headers['x-zoominfo-token'] !== undefined && AUTH_MODES.has('zoominfo_token')) {\n    if (!ZI_TOKEN) return { ok: false, method: 'zoominfo_token', reason: 'zoominfo_token_not_configured' };\n    return safeEqual(headers['x-zoominfo-token'], ZI_TOKEN) ? { ok: true, method: 'zoominfo_token' } : { ok: false, method: 'zoominfo_token', reason: 'zoominfo_token_mismatch' };\n  }\n  if (!AUTH_MODES.has('hmac_sha256')) return { ok: false, method: 'none', reason: 'no_accepted_auth_method' };\n  if (!SECRET) return { ok: false, method: 'hmac_sha256', reason: 'webhook_secret_not_configured' };\n  const provided = String(headers[SIG_HEADER] || '').replace(/^sha256=/i, '').trim();\n  const ts = String(headers[TS_HEADER] || '').trim();\n  if (!provided) return { ok: false, method: 'hmac_sha256', reason: 'signature_header_missing' };\n  if (!/^\\d{10,13}$/.test(ts)) return { ok: false, method: 'hmac_sha256', reason: 'timestamp_header_missing' };\n  const digest = crypto.createHmac('sha256', SECRET).update(`${ts}.${raw}`, 'utf8').digest();\n  if (!(safeEqual(provided.toLowerCase(), digest.toString('hex')) || safeEqual(provided, digest.toString('base64')))) return { ok: false, method: 'hmac_sha256', reason: 'signature_mismatch' };\n  const tsSec = ts.length > 10 ? Math.floor(Number(ts) / 1000) : Number(ts);\n  // Fixtures carry fixed timestamps, so the replay window is enforced outside sandbox only.\n  if (!SANDBOX_MODE && Math.abs(Date.now() / 1000 - tsSec) > TOLERANCE) return { ok: false, method: 'hmac_sha256', reason: 'timestamp_outside_tolerance' };\n  return { ok: true, method: 'hmac_sha256' };\n}\n\nconst cleanDomain = (v) => {\n  if (!v) return null;\n  let s = String(v).trim().toLowerCase();\n  if (s.includes('@')) s = s.split('@').pop();\n  s = s.replace(/^[a-z]+:\\/\\//, '').replace(/^www\\./, '').split(/[/?#:]/)[0].replace(/\\.$/, '');\n  return /^[a-z0-9-]+(\\.[a-z0-9-]+)+$/.test(s) ? s : null;\n};\nconst score = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n))) : null; };\nconst stageName = (v) => { if (!v) return null; const s = String(v).trim().toLowerCase(); return STAGE_ORDER.includes(s) ? s[0].toUpperCase() + s.slice(1) : String(v).trim().slice(0, 40); };\nconst topic = (name, s, extra = {}) => ({ topic: String(name || '').trim().slice(0, 120), category: extra.category ? String(extra.category).slice(0, 80) : null, score: score(s),\n  previousScore: score(extra.previousScore), trend: Number.isFinite(Number(extra.trend)) ? Number(extra.trend) : null, strength: extra.strength ? String(extra.strength).slice(0, 20) : null,\n  isNew: extra.isNew === true, signalDate: extra.signalDate || null });\n\n// ── Payload shapes ─────────────────────────────────────────────────────\nfunction parseAccounts(b, authMethod) {\n  // A · ZoomInfo webhook envelope: { webhookDetails, data: [ company records ] }\n  if (b && b.webhookDetails && Array.isArray(b.data)) {\n    return { provider: 'zoominfo', shape: 'zoominfo_webhook', accounts: b.data.map((r) => ({\n      providerAccountId: r.id != null ? String(r.id) : null, name: r.name || null, domain: cleanDomain(r.website || r.domain),\n      topics: (r.intentSignals || r.intent || r.topics || []).map((s) => topic(s.topic, s.signalScore ?? s.score, { category: s.category, trend: s.trend, strength: s.audienceStrength, isNew: s.newSignal, signalDate: s.signalDate })),\n      buyingStage: null, previousBuyingStage: null, accountScore: null, previousAccountScore: null, observedAt: null })) };\n  }\n  // B · ZoomInfo Intent API records forwarded by a relay: { data: [ { type: 'Intent', attributes: {...} } ] }\n  if (b && Array.isArray(b.data) && b.data.some((r) => r && r.attributes && r.attributes.topic)) {\n    const byCo = {};\n    for (const r of b.data) {\n      const a = r.attributes || {}; const co = a.company || {};\n      const key = cleanDomain(co.website || co.domain) || `zi:${co.id}`;\n      const acc = (byCo[key] = byCo[key] || { providerAccountId: co.id != null ? String(co.id) : null, name: co.name || null, domain: cleanDomain(co.website || co.domain), topics: [], buyingStage: null, previousBuyingStage: null, accountScore: null, previousAccountScore: null, observedAt: null });\n      acc.topics.push(topic(a.topic, a.signalScore, { category: a.category, trend: a.trend, strength: a.audienceStrength, isNew: a.newSignal, signalDate: a.signalDate }));\n      if (a.signalDate && (!acc.observedAt || a.signalDate > acc.observedAt)) acc.observedAt = a.signalDate;\n    }\n    return { provider: 'zoominfo', shape: 'zoominfo_intent_api', accounts: Object.values(byCo) };\n  }\n  // C · 6sense relay: { source: '6sense', accounts: [ ... ] }\n  if (b && /6sense|sixsense/i.test(String(b.source || '')) && Array.isArray(b.accounts)) {\n    return { provider: '6sense', shape: 'sixsense_relay', accounts: b.accounts.map((a) => ({\n      providerAccountId: a.accountId != null ? String(a.accountId) : null, name: a.name || a.accountName || null, domain: cleanDomain(a.domain || a.website),\n      topics: (a.intentKeywords || a.keywords || []).map((k) => (typeof k === 'string' ? topic(k, a.intentScore) : topic(k.keyword || k.topic, k.score ?? a.intentScore, { previousScore: k.previousScore, isNew: k.isNew }))),\n      buyingStage: stageName(a.buyingStage), previousBuyingStage: stageName(a.previousBuyingStage), accountScore: score(a.intentScore), previousAccountScore: score(a.previousIntentScore),\n      profileFit: a.profileFit || null, observedAt: a.updatedAt || null })) };\n  }\n  // D · Normalised relay format: { events: [ ... ] }\n  if (b && Array.isArray(b.events)) {\n    return { provider: String(b.source || 'relay').toLowerCase().slice(0, 30), shape: 'normalized', accounts: b.events.map((e) => ({\n      providerAccountId: e.accountId != null ? String(e.accountId) : null, name: e.accountName || e.name || null, domain: cleanDomain(e.domain || e.website),\n      topics: (e.topics || []).map((t) => topic(t.topic, t.score, { previousScore: t.previousScore, trend: t.trend, strength: t.strength, isNew: t.isNew, category: t.category })),\n      buyingStage: stageName(e.buyingStage), previousBuyingStage: stageName(e.previousBuyingStage), accountScore: score(e.accountScore), previousAccountScore: score(e.previousAccountScore), observedAt: e.observedAt || null })) };\n  }\n  return null;\n}\n\nfunction evaluate(acc) {\n  const topics = acc.topics.filter((t) => t.topic && t.score !== null && (!TRACKED.length || TRACKED.includes(t.topic.toLowerCase())));\n  for (const t of topics) t.delta = t.previousScore !== null ? t.score - t.previousScore : t.trend;\n  const surging = topics.filter((t) => t.score >= THRESHOLD && (t.isNew || (t.delta !== null && t.delta >= MIN_DELTA))).sort((a, b) => b.score - a.score);\n  const iFrom = STAGE_ORDER.indexOf(String(acc.previousBuyingStage || '').toLowerCase());\n  const iTo = STAGE_ORDER.indexOf(String(acc.buyingStage || '').toLowerCase());\n  const stageAdvanced = iTo > -1 && iTo > iFrom && acc.previousBuyingStage != null;\n  const stageSurge = stageAdvanced && SURGE_STAGES.includes(String(acc.buyingStage).toLowerCase());\n  const accountDelta = acc.accountScore !== null && acc.previousAccountScore !== null ? acc.accountScore - acc.previousAccountScore : null;\n  const accountSurge = acc.accountScore !== null && acc.accountScore >= THRESHOLD && accountDelta !== null && accountDelta >= MIN_DELTA;\n  const peak = Math.max(acc.accountScore || 0, ...topics.map((t) => t.score));\n  const reasons = [];\n  if (surging.length) reasons.push(`${surging.length} topic(s) ≥ ${THRESHOLD} and new or up ≥ ${MIN_DELTA}`);\n  if (stageSurge) reasons.push(`buying stage ${acc.previousBuyingStage} → ${acc.buyingStage}`);\n  if (accountSurge) reasons.push(`account intent score up ${accountDelta} to ${acc.accountScore}`);\n  return { topics: topics.sort((a, b) => b.score - a.score).slice(0, 10), surgingTopics: surging.slice(0, 5).map((t) => t.topic), isSurge: reasons.length > 0, reasons, peakScore: peak,\n    stageTransition: acc.previousBuyingStage || acc.buyingStage ? { from: acc.previousBuyingStage, to: acc.buyingStage, advanced: stageAdvanced, surge: stageSurge } : null, accountDelta };\n}\n\n// ── Ledger (cooldown + escalation) ────────────────────────────────────\nconst staticData = $getWorkflowStaticData('global');\nconst ledger = PERSIST ? (staticData.intentAlertLedger = staticData.intentAlertLedger || {}) : JSON.parse(JSON.stringify(staticData.intentAlertLedger || {}));\nconst nowMs = Date.now();\nfor (const [k, v] of Object.entries(ledger)) if (!v || nowMs - v.at > Math.max(COOLDOWN_H, 1) * 3600000 * 4) delete ledger[k];\nconst seenThisRun = {};\n\nconst out = [];\nfor (let index = 0; index < items.length; index++) {\n  const item = items[index];\n  const headers = {};\n  for (const [k, v] of Object.entries(item.json.headers || {})) headers[String(k).toLowerCase()] = Array.isArray(v) ? String(v[0]) : String(v);\n  let raw = null;\n  if (item.binary && item.binary.data) { try { raw = (await helpers.getBinaryDataBuffer(index, 'data')).toString('utf8'); } catch (e) { raw = null; } }\n  let body = item.json.body;\n  if ((!body || (typeof body === 'object' && !Object.keys(body).length)) && raw) { try { body = JSON.parse(raw); } catch (e) { body = null; } }\n  if (raw === null) raw = typeof body === 'string' ? body : JSON.stringify(body ?? {});\n  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = null; } }\n  const deliveryId = String(headers['x-intent-delivery-id'] || (body && (body.deliveryId || (body.webhookDetails && body.webhookDetails.id))) || `delivery-${index + 1}`).slice(0, 80);\n  const base = { run, sandboxFixtures: sharedFixtures, deliveryId };\n\n  const auth = authenticate(headers, raw);\n  if (!auth.ok) { out.push({ json: { ...base, kind: 'rejected', reason: auth.reason, authMethod: auth.method || null } }); continue; }\n  const parsed = parseAccounts(body, auth.method);\n  if (!parsed) { out.push({ json: { ...base, kind: 'ignored', reason: 'unrecognised_payload_shape', authMethod: auth.method } }); continue; }\n  if (parsed.accounts.length > MAX_ACCOUNTS) parsed.accounts = parsed.accounts.slice(0, MAX_ACCOUNTS);\n\n  for (const acc of parsed.accounts) {\n    const signal = { provider: parsed.provider, shape: parsed.shape, providerAccountId: acc.providerAccountId, accountName: acc.name ? String(acc.name).slice(0, 120) : null, domain: acc.domain,\n      buyingStage: acc.buyingStage, accountScore: acc.accountScore, profileFit: acc.profileFit || null, observedAt: acc.observedAt };\n    const ignore = (reason, extra = {}) => out.push({ json: { ...base, kind: 'ignored', reason, authMethod: auth.method, signal, ...extra } });\n    if (!acc.domain) { ignore('domain_missing_or_invalid'); continue; }\n    if (EXCLUDED.has(acc.domain)) { ignore('excluded_domain'); continue; }\n    const ev = evaluate(acc);\n    signal.topics = ev.topics; signal.surgingTopics = ev.surgingTopics; signal.peakScore = ev.peakScore; signal.stageTransition = ev.stageTransition; signal.accountDelta = ev.accountDelta;\n    if (!ev.topics.length && signal.accountScore === null && !ev.stageTransition) { ignore('no_tracked_intent'); continue; }\n    if (!ev.isSurge) { ignore('below_surge_threshold', { surge: { peakScore: ev.peakScore } }); continue; }\n\n    const prev = seenThisRun[acc.domain] || ledger[acc.domain];\n    let escalation = false;\n    if (prev && nowMs - prev.at < COOLDOWN_H * 3600000) {\n      const stageUp = STAGE_ORDER.indexOf(String(acc.buyingStage || '').toLowerCase()) > STAGE_ORDER.indexOf(String(prev.stage || '').toLowerCase());\n      const scoreUp = ev.peakScore - (prev.peakScore || 0) >= MIN_DELTA;\n      if (!stageUp && !scoreUp) { ignore('cooldown_active', { cooldown: { hours: COOLDOWN_H, lastAlertAt: new Date(prev.at).toISOString() } }); continue; }\n      escalation = true;\n    }\n    seenThisRun[acc.domain] = { at: nowMs, peakScore: ev.peakScore, stage: acc.buyingStage };\n    out.push({ json: { ...base, kind: 'surge', authMethod: auth.method, signal, surge: { reasons: ev.reasons, escalation, peakScore: ev.peakScore } } });\n  }\n}\nreturn out;\n"
+      },
+      "id": "60b4e7a0-186b-573b-9bdd-ac5ac111c84d",
+      "name": "Verify Signature & Normalize Intent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "notes": "HMAC-SHA256 over timestamp.body (default) or x-zoominfo-token · 4 payload shapes · domain cleanup · surge rules · cooldown & escalation."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "f893bad9-120d-58d1-b4d6-084ce3aac4d2",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "surge",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8234c320-317e-5c7c-948b-c579f8a79ac1",
+      "name": "Surge Detected?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Account Lookup                  Mode: Run Once for Each Item\n// Builds the HubSpot company search for the normalised domain.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst TIER_PROP = env('HUBSPOT_TIER_PROPERTY', 'hs_ideal_customer_profile');\nconst d = $json.signal.domain;\nreturn {\n  json: {\n    ...$json,\n    lookup: {\n      tierProperty: TIER_PROP,\n      companySearch: {\n        filterGroups: [\n          { filters: [{ propertyName: 'domain', operator: 'EQ', value: d }] },\n          { filters: [{ propertyName: 'domain', operator: 'EQ', value: `www.${d}` }] },\n          { filters: [{ propertyName: 'hs_additional_domains', operator: 'CONTAINS_TOKEN', value: d }] },\n        ],\n        properties: ['name', 'domain', 'website', 'hs_additional_domains', 'hubspot_owner_id', TIER_PROP, 'hs_is_target_account', 'hs_num_open_deals', 'hs_lastmodifieddate'],\n        limit: 10,\n      },\n    },\n  },\n};\n"
+      },
+      "id": "a93a7beb-f599-5dee-8b32-cb485541f8a2",
+      "name": "Build Account Lookup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e3ea4bc4-fd4b-5663-b78f-141310218cb4",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "60bc6e3f-e1fa-5a0e-9ef8-7def875332ba",
+      "name": "Sandbox HubSpot?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate HubSpot Lookup (Sandbox)     Mode: Run Once for Each Item\n// Answers the company, open-deal and open-task searches from fictional\n// fixtures, in the CRM search response shape the live nodes return.\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json;\nconst fx = item.sandboxFixtures || {};\nconst d = item.signal.domain;\nconst norm = (v) => String(v || '').toLowerCase().replace(/^[a-z]+:\\/\\//, '').replace(/^www\\./, '').split('/')[0];\nconst companies = (fx.companies || []).filter((c) => norm(c.properties.domain) === d || String(c.properties.hs_additional_domains || '').toLowerCase().split(/[;,\\s]+/).includes(d));\nconst ok = (list) => ({ statusCode: 200, body: { total: list.length, results: list.map((r) => ({ id: r.id, properties: r.properties })) } });\nconst co = companies[0] || null;\nconst deals = co ? (fx.deals || []).filter((x) => x.companyId === co.id && x.properties.hs_is_closed !== 'true') : [];\nconst tasks = co ? (fx.tasks || []).filter((x) => x.companyId === co.id && x.properties.hs_task_status !== 'COMPLETED') : [];\nreturn { json: { ...item, simulatedLookup: { company: ok(companies), deals: ok(deals), tasks: ok(tasks) } } };\n"
+      },
+      "id": "a92b9155-2f77-5d0d-986c-759bfc912548",
+      "name": "Simulate HubSpot Lookup (Sandbox)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/companies/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.lookup.companySearch) }}"
+      },
+      "id": "985b4844-a2de-56dc-9667-72b61b92a6ea",
+      "name": "Search Company by Domain",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        340
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Scope crm.objects.companies.read · domain, www.domain, hs_additional_domains."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Pick Company & Build Searches         Mode: Run Once for Each Item\n// Chooses the best company for the domain (exact primary domain first),\n// then builds the open-deal and recent-task searches for it.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst TASK_WINDOW_DAYS = Math.max(1, num('TASK_DEDUPE_DAYS', 7));\nconst PIPELINES = csv('HUBSPOT_DEAL_PIPELINE_IDS', '');\nconst sandbox = !!($json && $json.simulatedLookup);\nconst ctx = sandbox ? $json : $('Build Account Lookup').item.json;\nconst res = sandbox ? $json.simulatedLookup.company : $json;\nconst d = ctx.signal.domain;\nconst tierProp = ctx.lookup.tierProperty;\nconst norm = (v) => String(v || '').toLowerCase().replace(/^[a-z]+:\\/\\//, '').replace(/^www\\./, '').split('/')[0];\n\nlet companyLookup;\nif (Number(res && res.statusCode) !== 200 || !res.body || !Array.isArray(res.body.results)) {\n  companyLookup = { status: 'lookup_failed', httpStatus: (res && res.statusCode) || null };\n} else {\n  const ranked = res.body.results.map((c) => {\n    const p = c.properties || {};\n    const exact = norm(p.domain) === d || norm(p.website) === d;\n    const extra = String(p.hs_additional_domains || '').toLowerCase().split(/[;,\\s]+/).map(norm).includes(d);\n    return { c, p, rank: (exact ? 100 : extra ? 50 : 0) + (p[tierProp] ? 8 : 0) + (String(p.hs_is_target_account) === 'true' ? 4 : 0) + (p.hubspot_owner_id ? 2 : 0) + (Number(p.hs_num_open_deals) > 0 ? 1 : 0), exact, extra };\n  }).filter((x) => x.exact || x.extra).sort((a, b) => b.rank - a.rank);\n  if (!ranked.length) companyLookup = { status: 'not_found' };\n  else {\n    const top = ranked[0];\n    companyLookup = {\n      status: 'found', matchedOn: top.exact ? 'primary_domain' : 'additional_domain', duplicateCount: ranked.filter((x) => x.exact).length,\n      company: { id: String(top.c.id), name: top.p.name || null, domain: top.p.domain || null, ownerId: top.p.hubspot_owner_id || null, tierRaw: top.p[tierProp] || null,\n        isTargetAccount: String(top.p.hs_is_target_account) === 'true', openDeals: Number(top.p.hs_num_open_deals || 0) },\n    };\n  }\n}\nconst cid = companyLookup.company ? companyLookup.company.id : '0';\nconst dealFilters = [{ propertyName: 'associations.company', operator: 'EQ', value: cid }, { propertyName: 'hs_is_closed', operator: 'EQ', value: 'false' }];\nif (PIPELINES.length) dealFilters.push({ propertyName: 'pipeline', operator: 'IN', values: PIPELINES });\nconst { simulatedLookup, ...rest } = ctx;\nreturn {\n  json: {\n    ...rest,\n    ...(sandbox ? { simulatedLookup } : {}),\n    companyLookup,\n    searches: {\n      deals: { filterGroups: [{ filters: dealFilters }], properties: ['dealname', 'dealstage', 'pipeline', 'amount', 'closedate', 'hubspot_owner_id', 'hs_lastmodifieddate'],\n        sorts: [{ propertyName: 'hs_lastmodifieddate', direction: 'DESCENDING' }], limit: 5 },\n      tasks: { filterGroups: [{ filters: [{ propertyName: 'associations.company', operator: 'EQ', value: cid }, { propertyName: 'hs_task_status', operator: 'NEQ', value: 'COMPLETED' },\n        { propertyName: 'hs_createdate', operator: 'GTE', value: String(Date.now() - TASK_WINDOW_DAYS * 86400000) }] }],\n        properties: ['hs_task_subject', 'hs_task_status', 'hubspot_owner_id', 'hs_timestamp'], limit: 20 },\n    },\n  },\n};\n"
+      },
+      "id": "b51ed5fb-fa1a-5ec6-9969-94d303f8be6b",
+      "name": "Pick Company & Build Searches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        200
+      ],
+      "notes": "Primary domain beats additional domain; tier, target flag and owner break ties."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b0a03be7-15b4-598f-b66d-1a9eefda5b00",
+              "leftValue": "={{ !$json.simulatedLookup }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "9ad0dbd4-3701-5ee6-ac26-add58175ae46",
+      "name": "Live Account Details?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1680,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/deals/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.searches.deals) }}"
+      },
+      "id": "1a841640-e7c1-535c-a974-5214a4ee38ac",
+      "name": "Search Open Deals",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1920,
+        340
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Scope crm.objects.deals.read · associations.company + hs_is_closed=false."
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/tasks/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Pick Company & Build Searches').item.json.searches.tasks) }}"
+      },
+      "id": "d6cc3b52-8e6d-51f5-abea-4ca2c3b3200a",
+      "name": "Search Recent Intent Tasks",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2160,
+        340
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Open tasks on the company created within TASK_DEDUPE_DAYS."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Resolve Tier, Deal & Owner            Mode: Run Once for Each Item\n// Tier:  HUBSPOT_TIER_PROPERTY value → tier_1 | tier_2 | tier_3 (TIER_VALUE_MAP_JSON);\n//        untiered target accounts → UNTIERED_TARGET_ACCOUNT_TIER; else untiered.\n// Deal:  most recently modified open deal associated with the company.\n// Owner: open-deal owner → company owner → FALLBACK_OWNER_ID.\n// Also finds an existing open intent task created in the dedupe window.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst PREFIX = env('TASK_SUBJECT_PREFIX', 'Intent spike:');\nconst UNTIERED_TARGET = env('UNTIERED_TARGET_ACCOUNT_TIER', 'tier_2');\nconst placeholder = (v) => !v || /^YOUR_/i.test(String(v));\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst envFallback = placeholder(env('FALLBACK_OWNER_ID', '')) ? null : env('FALLBACK_OWNER_ID', '');\nconst fxFallback = SANDBOX_MODE && $json && $json.sandboxFixtures ? $json.sandboxFixtures.fallbackOwnerId || null : null;\nconst FALLBACK_OWNER = envFallback || fxFallback;\nlet MAP = { tier_1: 'tier_1', tier_2: 'tier_2', tier_3: 'tier_3', 'tier 1': 'tier_1', 'tier 2': 'tier_2', 'tier 3': 'tier_3', '1': 'tier_1', '2': 'tier_2', '3': 'tier_3' };\ntry { const m = JSON.parse(env('TIER_VALUE_MAP_JSON', '')); if (m && typeof m === 'object') MAP = Object.fromEntries(Object.entries(m).map(([k, v]) => [String(k).toLowerCase(), String(v)])); } catch (e) { /* keep default */ }\n\nconst sandbox = !!($json && $json.simulatedLookup);\nconst ctx = sandbox ? $json : $('Pick Company & Build Searches').item.json;\nconst dealsRes = sandbox ? ctx.simulatedLookup.deals : $('Search Open Deals').item.json;\nconst tasksRes = sandbox ? ctx.simulatedLookup.tasks : $json;\nconst cl = ctx.companyLookup;\nconst okList = (r) => (Number(r && r.statusCode) === 200 && r.body && Array.isArray(r.body.results) ? r.body.results : null);\nconst lookupErrors = [];\nif (cl.status === 'lookup_failed') lookupErrors.push(`company search ${cl.httpStatus || 'network error'}`);\n\nlet account = { status: cl.status, matchedOn: cl.matchedOn || null, duplicateCount: cl.duplicateCount || 0, company: cl.company || null, tier: null, deal: null, openDealCount: 0, owner: null, existingTask: null };\nif (cl.status === 'found') {\n  const raw = cl.company.tierRaw ? String(cl.company.tierRaw).toLowerCase().trim() : '';\n  account.tier = MAP[raw] || (cl.company.isTargetAccount ? UNTIERED_TARGET : 'untiered');\n  account.tierSource = MAP[raw] ? 'tier_property' : cl.company.isTargetAccount ? 'target_account_default' : 'none';\n  const deals = okList(dealsRes);\n  if (!deals) lookupErrors.push(`deal search ${(dealsRes && dealsRes.statusCode) || 'network error'}`);\n  else if (deals.length) {\n    const d = deals[0]; const p = d.properties || {};\n    account.deal = { id: String(d.id), name: p.dealname || null, stage: p.dealstage || null, pipeline: p.pipeline || null, amount: p.amount != null && p.amount !== '' ? Number(p.amount) : null, closeDate: p.closedate || null, ownerId: p.hubspot_owner_id || null };\n    account.openDealCount = deals.length;\n  }\n  const tasks = okList(tasksRes);\n  if (!tasks) lookupErrors.push(`task search ${(tasksRes && tasksRes.statusCode) || 'network error'}`);\n  else {\n    const t = tasks.find((x) => String((x.properties || {}).hs_task_subject || '').startsWith(PREFIX));\n    if (t) account.existingTask = { id: String(t.id), subject: String(t.properties.hs_task_subject).slice(0, 160), ownerId: t.properties.hubspot_owner_id || null };\n  }\n  if (account.deal && account.deal.ownerId) account.owner = { id: String(account.deal.ownerId), source: 'deal_owner' };\n  else if (cl.company.ownerId) account.owner = { id: String(cl.company.ownerId), source: 'company_owner' };\n  else if (FALLBACK_OWNER) account.owner = { id: FALLBACK_OWNER, source: 'fallback_owner' };\n}\naccount.lookupErrors = lookupErrors;\nconst { simulatedLookup, searches, lookup, ...rest } = ctx;\nreturn { json: { ...rest, account } };\n"
+      },
+      "id": "5fc301c4-a9d8-5c20-bca8-46f5a57ed79e",
+      "name": "Resolve Tier, Deal & Owner",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        200
+      ],
+      "notes": "Tier map · most recent open deal · deal owner → company owner → fallback."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Priority Task Router                  Mode: Run Once for Each Item\n// Applies the tier rules (TIER_RULES_JSON) to decide: create an outreach\n// task, send a Slack alert, both, or log only. Builds the HubSpot task.\n// Default rules:\n//   tier_1  task HIGH · CALL · due 4 h   · Slack always\n//   tier_2  task MEDIUM · EMAIL · due 24 h · Slack when hot (stage surge,\n//           score ≥ SLACK_HOT_SCORE, open deal, or escalation)\n//   tier_3  no task (set task:true to enable) · no Slack\n//   untiered / unknown account: log only\n// An open deal raises the task priority to HIGH (OPEN_DEAL_PRIORITY_BOOST).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst PREFIX = env('TASK_SUBJECT_PREFIX', 'Intent spike:');\nconst HOT = num('SLACK_HOT_SCORE', 90);\nconst BOOST = flag('OPEN_DEAL_PRIORITY_BOOST', true);\nconst UNKNOWN_ALERT = num('UNKNOWN_ACCOUNT_ALERT_SCORE', 0);\nconst DEFAULT_RULES = {\n  tier_1: { task: true, priority: 'HIGH', type: 'CALL', dueHours: 4, slack: 'always' },\n  tier_2: { task: true, priority: 'MEDIUM', type: 'EMAIL', dueHours: 24, slack: 'when_hot' },\n  tier_3: { task: false, priority: 'LOW', type: 'TODO', dueHours: 72, slack: 'never' },\n  untiered: { task: false, priority: 'LOW', type: 'TODO', dueHours: 72, slack: 'never' },\n};\nlet RULES = DEFAULT_RULES;\ntry { const r = JSON.parse(env('TIER_RULES_JSON', '')); if (r && typeof r === 'object') RULES = { ...DEFAULT_RULES, ...r }; } catch (e) { /* defaults */ }\nconst PRIORITIES = ['LOW', 'MEDIUM', 'HIGH'];\nconst TYPES = ['CALL', 'EMAIL', 'TODO'];\n\nconst item = $json;\nconst s = item.signal;\nconst a = item.account;\nconst st = s.stageTransition;\nconst hot = (st && st.surge) || s.peakScore >= HOT || !!a.deal || item.surge.escalation;\nconst holds = [];\nlet task = false; let slack = false; let rule = null;\n\nif (a.status === 'lookup_failed' || a.lookupErrors.length) { holds.push(`HubSpot lookup failed: ${a.lookupErrors.join('; ')}`); slack = true; }\nelse if (a.status === 'not_found') { holds.push('domain not found in HubSpot'); slack = UNKNOWN_ALERT > 0 && s.peakScore >= UNKNOWN_ALERT; }\nelse {\n  rule = { ...DEFAULT_RULES.untiered, ...(RULES[a.tier] || RULES.untiered) };\n  task = rule.task === true;\n  slack = rule.slack === 'always' || (rule.slack === 'when_hot' && hot);\n  if (!task) holds.push(`${a.tier.replace('_', ' ')} accounts don't get tasks`);\n  if (task && a.existingTask) { task = false; holds.push('an open intent task already exists'); }\n  if (task && !a.owner) { task = false; slack = slack || a.tier === 'tier_1' || a.tier === 'tier_2'; holds.push('no deal owner, company owner or FALLBACK_OWNER_ID'); }\n}\n\nlet requests = null; let taskPlan = null;\nif (task) {\n  let priority = PRIORITIES.includes(String(rule.priority).toUpperCase()) ? String(rule.priority).toUpperCase() : 'MEDIUM';\n  if (BOOST && a.deal) priority = 'HIGH';\n  const type = TYPES.includes(String(rule.type).toUpperCase()) ? String(rule.type).toUpperCase() : 'TODO';\n  const dueMs = Date.now() + Math.max(0.25, Number(rule.dueHours) || 24) * 3600000;\n  const top = s.topics[0];\n  const subject = `${PREFIX} ${a.company.name || s.accountName || s.domain} · ${top ? `${top.topic} (${top.score})` : `score ${s.peakScore}`}`.slice(0, 250);\n  const esc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n  const stageLine = st && st.to ? `<p><b>Buying stage:</b> ${esc(st.from || 'unknown')} → ${esc(st.to)}</p>` : '';\n  const next = st && /decision|purchase/i.test(String(st.to || '')) ? 'They look close to a decision: call the champion, confirm the buying group and timeline, and offer a tailored demo.'\n    : a.deal ? 'Re-engage the open deal: share content on the surging topics and confirm next steps with the deal contacts.'\n    : 'Open a conversation: research who is evaluating, then reach out on the surging topics within the due window.';\n  const body = `<p><b>${esc(s.provider)} intent surge</b> for ${esc(a.company.name || s.domain)} (${esc(s.domain)}) · ${esc(a.tier.replace('_', ' '))}${item.surge.escalation ? ' · <i>escalated</i>' : ''}</p>`\n    + `<p><b>Why:</b> ${esc(item.surge.reasons.join('; '))}</p>${stageLine}`\n    + `<ul>${s.topics.slice(0, 6).map((t) => `<li>${esc(t.topic)}: <b>${t.score}</b>${t.delta != null ? ` (${t.delta >= 0 ? '+' : ''}${t.delta})` : ''}${t.isNew ? ' · new' : ''}${t.strength ? ` · audience ${esc(t.strength)}` : ''}</li>`).join('')}</ul>`\n    + (a.deal ? `<p><b>Open deal:</b> ${esc(a.deal.name)} (${esc(a.deal.stage)})</p>` : '')\n    + `<p><b>Suggested next step:</b> ${esc(next)}</p><p><i>Intent is account-level research activity, not a contact request. Run ${esc(item.run.runId)}.</i></p>`;\n  const associations = [{ to: { id: a.company.id }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 192 }] }];\n  if (a.deal) associations.push({ to: { id: a.deal.id }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 216 }] });\n  taskPlan = { priority, type, dueAt: new Date(dueMs).toISOString(), ownerId: a.owner.id, ownerSource: a.owner.source, subject };\n  requests = { task: { properties: { hs_timestamp: new Date(dueMs).toISOString(), hs_task_subject: subject, hs_task_body: body, hs_task_status: 'NOT_STARTED', hs_task_priority: priority, hs_task_type: type, hubspot_owner_id: a.owner.id }, associations } };\n}\nconst action = task && slack ? 'task_and_alert' : task ? 'task' : slack ? 'alert_only' : 'log_only';\nreturn { json: { ...item, decision: { action, createTask: task, sendSlack: slack, hot, holds, tierRule: rule }, taskPlan, requests } };\n"
+      },
+      "id": "b74b04a8-ae98-555e-95d2-08689f27bc00",
+      "name": "Priority Task Router",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        200
+      ],
+      "notes": "TIER_RULES_JSON · open-deal boost · existing-task and no-owner holds."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a67f5dc8-49e8-5466-9ea8-4b15fef9deb4",
+              "leftValue": "={{ $json.decision.createTask }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "bd09c252-666c-535e-8ad3-e1c1f880382c",
+      "name": "Create Task?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2880,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "71adac24-2913-5f22-aa73-22c4324fd59a",
+              "leftValue": "={{ !$json.run.sandboxMode && !$json.run.dryRun }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b559962d-d429-58eb-867c-dcc196a44da1",
+      "name": "Live Writes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3120,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Task Creation (Dry Run)      Mode: Run Once for Each Item\n// No network call. Shows the task that would be created.\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json;\nconst { requests, ...rest } = item;\nreturn { json: { ...rest, taskResult: { simulated: true, ok: true, taskId: null, mode: item.run.mode }, preview: { task: requests.task.properties, associations: requests.task.associations.map((x) => ({ id: x.to.id, typeId: x.types[0].associationTypeId })) } } };\n"
+      },
+      "id": "98560af6-b154-575c-941c-98237c2648eb",
+      "name": "Simulate Task Creation (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        -20
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/tasks",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requests.task) }}"
+      },
+      "id": "33ea0f56-cda8-5f13-8fc5-17c0cdf61d49",
+      "name": "Create Outreach Task",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        180
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Task→company 192, task→deal 216 · never auto-retried (no duplicate tasks)."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Capture Task Result                   Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['INTENT_WEBHOOK_SECRET', 'ZOOMINFO_WEBHOOK_TOKEN', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\nconst ctx = $('Live Writes?').item.json;\nconst res = $json || {};\nconst status = Number(res.statusCode || 0);\nconst ok = status >= 200 && status < 300 && res.body && res.body.id;\nconst { requests, ...rest } = ctx;\nreturn {\n  json: {\n    ...rest,\n    taskResult: ok ? { simulated: false, ok: true, taskId: String(res.body.id), httpStatus: status }\n      : { simulated: false, ok: false, taskId: null, httpStatus: status || null, message: redactString((res.body && (res.body.message || res.body.category)) || 'task create failed').slice(0, 200) },\n  },\n};\n"
+      },
+      "id": "a250f83d-9b0a-5514-a5ed-f73fbeab4a71",
+      "name": "Capture Task Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Slack Alert                     Mode: Run Once for Each Item\n// Block Kit alert for tier-1 (and hot tier-2) intent surges, plus ops\n// alerts for lookup failures, missing owners and failed task writes.\n// Account-level data only: no contact names, emails or phone numbers.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst PORTAL = env('HUBSPOT_PORTAL_ID', 'YOUR_HUBSPOT_PORTAL_ID');\nconst APP = env('HUBSPOT_APP_BASE_URL', 'https://app.hubspot.com').replace(/\\/+$/, '');\nlet OWNER_MAP = {};\ntry { OWNER_MAP = JSON.parse(env('SLACK_OWNER_MAP_JSON', '')) || {}; } catch (e) { OWNER_MAP = {}; }\n\nconst item = $json;\nconst s = item.signal; const a = item.account; const dcs = item.decision; const tr = item.taskResult || null;\nconst esc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst writeFailed = tr && tr.ok === false;\nconst send = dcs.sendSlack || writeFailed;\nlet slackMessage = null;\nif (send) {\n  const tierLabel = a.tier ? a.tier.replace('tier_', 'Tier ') : a.status === 'not_found' ? 'Not in HubSpot' : 'Unknown';\n  const title = writeFailed ? `⚠️ Intent task could not be created · ${a.company ? a.company.name : s.domain}`\n    : a.status === 'lookup_failed' || a.lookupErrors.length ? `⚠️ Intent surge, HubSpot lookup failed · ${s.domain}`\n    : `${a.tier === 'tier_1' ? '🔥' : '📈'} ${tierLabel} intent surge · ${a.company ? a.company.name : s.accountName || s.domain}`;\n  const record = (type, id) => `${APP}/contacts/${encodeURIComponent(PORTAL)}/record/${type}/${encodeURIComponent(id)}`;\n  const real = (id) => id && !String(id).startsWith('sandbox');\n  const mention = a.owner && OWNER_MAP[a.owner.id] && /^[UW][A-Z0-9]{6,}$/.test(OWNER_MAP[a.owner.id]) ? `<@${OWNER_MAP[a.owner.id]}>` : null;\n  const blocks = [{ type: 'header', text: { type: 'plain_text', text: title.slice(0, 150), emoji: true } }];\n  if (mention && dcs.createTask) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${mention} new high-intent account task for you` } });\n  blocks.push({ type: 'section', fields: [\n    { type: 'mrkdwn', text: `*Account*\\n${esc(a.company ? a.company.name : s.accountName || 'n/a')}\\n\\`${esc(s.domain)}\\`` },\n    { type: 'mrkdwn', text: `*Tier · source*\\n${esc(tierLabel)} · ${esc(s.provider)}` },\n    { type: 'mrkdwn', text: `*Peak intent*\\n${esc(s.peakScore)}/100${item.surge.escalation ? ' · escalated' : ''}` },\n    { type: 'mrkdwn', text: `*Buying stage*\\n${s.stageTransition && s.stageTransition.to ? `${esc(s.stageTransition.from || '—')} → *${esc(s.stageTransition.to)}*` : 'n/a'}` },\n    { type: 'mrkdwn', text: `*Open deal*\\n${a.deal ? `${esc(a.deal.name)} (${esc(a.deal.stage)})` : 'none'}` },\n    { type: 'mrkdwn', text: `*Owner*\\n${a.owner ? `${esc(a.owner.id)} (${esc(a.owner.source.replace('_', ' '))})` : 'unassigned'}` },\n  ] });\n  const topics = s.topics.slice(0, 6).map((t) => `• *${esc(t.topic)}*: ${t.score}${t.delta != null ? ` (${t.delta >= 0 ? '+' : ''}${t.delta})` : ''}${t.isNew ? ' 🆕' : ''}`);\n  if (topics.length) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*Intent topics*\\n${topics.join('\\n')}`.slice(0, 2900) } });\n  const lines = [];\n  if (dcs.createTask && item.taskPlan) lines.push(`✅ ${tr && tr.simulated ? 'Would create' : 'Created'} ${item.taskPlan.priority} ${item.taskPlan.type} task, due ${esc(item.taskPlan.dueAt.replace('T', ' ').slice(0, 16))} UTC`);\n  for (const h of dcs.holds) lines.push(`• ${esc(h)}`);\n  if (a.existingTask) lines.push(`• Existing task: ${esc(a.existingTask.subject)}`);\n  if (a.duplicateCount > 1) lines.push(`• ${a.duplicateCount} companies share this domain; check for duplicates`);\n  if (writeFailed) lines.push(`• HubSpot answered ${esc(tr.httpStatus)}: ${esc(tr.message)}`);\n  if (lines.length) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: lines.join('\\n').slice(0, 2900) } });\n  const buttons = [];\n  if (a.company && real(a.company.id)) buttons.push({ type: 'button', text: { type: 'plain_text', text: 'Open company', emoji: true }, url: record('0-2', a.company.id), ...(a.tier === 'tier_1' ? { style: 'primary' } : {}) });\n  if (a.deal && real(a.deal.id)) buttons.push({ type: 'button', text: { type: 'plain_text', text: 'Open deal', emoji: true }, url: record('0-3', a.deal.id) });\n  if (!buttons.length) buttons.push({ type: 'button', text: { type: 'plain_text', text: 'Open HubSpot companies', emoji: true }, url: `${APP}/contacts/${encodeURIComponent(PORTAL)}/objects/0-2/views/all/list` });\n  blocks.push({ type: 'actions', elements: buttons });\n  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Why: ${esc(item.surge.reasons.join('; '))} · run \\`${esc(item.run.runId)}\\` · mode ${esc(item.run.mode)}${tr && tr.simulated ? ' _(simulated)_' : ''}` }] });\n  slackMessage = { text: title, blocks };\n}\nconst slackDelivery = !send ? 'none' : SANDBOX_MODE || DRY_RUN ? 'dry_run' : env('SLACK_WEBHOOK_URL', '') ? 'live' : 'not_configured';\nreturn { json: { ...item, sandboxFixtures: undefined, slackDelivery, slackMessage } };\n"
+      },
+      "id": "aeb959b4-c137-5620-b268-5c1e08329a10",
+      "name": "Build Slack Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3840,
+        300
+      ],
+      "notes": "Block Kit · account-level data only · optional owner mention map."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b86b428e-858b-5fe4-ad36-271f218c9ad3",
+              "leftValue": "={{ $json.slackDelivery }}",
+              "rightValue": "live",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d3161e3c-8e56-5d77-a9b5-8a8e4b6c9408",
+      "name": "Post Slack Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4080,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "8f0a2fb2-e61d-51db-a582-a7921109ec42",
+      "name": "Post Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4320,
+        200
+      ],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Confirm Slack Delivery                Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst ctx = $('Post Slack Alert?').item.json;\nreturn { json: { ...ctx, slackMessage: undefined, slackResult: { simulated: false, mode: 'live', ok: true, at: new Date().toISOString() } } };\n"
+      },
+      "id": "f8192c5a-4a07-5f66-adcb-7130c6b7f963",
+      "name": "Confirm Slack Delivery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4560,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitize Slack Error                  Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['INTENT_WEBHOOK_SECRET', 'ZOOMINFO_WEBHOOK_TOKEN', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\nconst ctx = $('Post Slack Alert?').item.json;\nconst err = $json.error ?? $json;\nconst message = typeof err === 'string' ? err : (err && (err.message || err.description)) || 'slack_post_failed';\nconst httpCode = (err && (err.httpCode || err.statusCode || err.status)) || null;\nreturn { json: { ...ctx, slackMessage: undefined, slackResult: { simulated: false, mode: 'live', ok: false, httpCode: httpCode ? String(httpCode) : null, message: redactString(message).slice(0, 300) } } };\n"
+      },
+      "id": "38139aa5-ad99-5b06-af9a-f379282f9ecc",
+      "name": "Sanitize Slack Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4560,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Slack Alert (Dry Run)        Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json;\nreturn { json: { ...item, slackResult: { simulated: true, mode: item.slackDelivery || 'none', blockCount: item.slackMessage ? item.slackMessage.blocks.length : 0,\n  note: item.slackDelivery === 'not_configured' ? 'SLACK_WEBHOOK_URL not set: alert not posted' : item.slackDelivery === 'dry_run' ? 'dry run: Block Kit built, not posted' : 'no alert needed' } } };\n"
+      },
+      "id": "360c2253-c89a-5ae8-b7ea-b5bd0242da08",
+      "name": "Simulate Slack Alert (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4320,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Audit Logger                          Mode: Run Once for Each Item\n// One redacted record per account signal (or rejected delivery): IDs,\n// domains, tiers, scores, enums and counts only. Live runs also write the\n// cooldown ledger once a task or alert actually went out.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['INTENT_WEBHOOK_SECRET', 'ZOOMINFO_WEBHOOK_TOKEN', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst RING_SIZE = Math.max(0, num('AUDIT_RING_BUFFER_SIZE', 500));\nconst LOG_TO_STDOUT = flag('AUDIT_LOG_TO_STDOUT', true);\n\nconst item = $json;\nconst s = item.signal || null; const a = item.account || null; const d = item.decision || null;\nconst record = redact({\n  auditVersion: 1,\n  at: new Date().toISOString(),\n  workflowId: $workflow.id || null,\n  executionId: $execution.id || null,\n  runId: item.run ? item.run.runId : null,\n  mode: item.run ? item.run.mode : null,\n  deliveryId: item.deliveryId || null,\n  kind: item.kind || null,\n  reason: item.reason || null,\n  authMethod: item.authMethod || null,\n  signal: s ? { provider: s.provider, shape: s.shape, domain: s.domain, peakScore: s.peakScore ?? null, topicCount: (s.topics || []).length, surgingTopics: s.surgingTopics || [],\n    stage: s.stageTransition ? `${s.stageTransition.from || '-'}>${s.stageTransition.to || '-'}` : null } : null,\n  surge: item.surge ? { reasons: item.surge.reasons || [], escalation: !!item.surge.escalation } : null,\n  account: a ? { status: a.status, companyId: a.company ? a.company.id : null, tier: a.tier, tierSource: a.tierSource || null, dealId: a.deal ? a.deal.id : null, ownerId: a.owner ? a.owner.id : null,\n    ownerSource: a.owner ? a.owner.source : null, existingTaskId: a.existingTask ? a.existingTask.id : null, lookupErrors: a.lookupErrors } : null,\n  decision: d ? { action: d.action, createTask: d.createTask, sendSlack: d.sendSlack, hot: d.hot, holdCount: d.holds.length } : null,\n  task: item.taskResult ? { simulated: item.taskResult.simulated, ok: item.taskResult.ok, taskId: item.taskResult.taskId, priority: item.taskPlan ? item.taskPlan.priority : null } : null,\n  slack: item.slackResult || null,\n});\n\nconst taskOk = !!(item.taskResult && item.taskResult.ok && !item.taskResult.simulated);\nconst slackOk = !!(item.slackResult && item.slackResult.ok && !item.slackResult.simulated);\n// A failed task write never starts the cooldown, so the next surge can retry it.\nconst acted = d && d.createTask ? taskOk : slackOk;\nif (!SANDBOX_MODE && !DRY_RUN) {\n  try {\n    const store = $getWorkflowStaticData('global');\n    if (acted && s && s.domain) {\n      store.intentAlertLedger = store.intentAlertLedger || {};\n      store.intentAlertLedger[s.domain] = { at: Date.now(), peakScore: s.peakScore, stage: s.stageTransition ? s.stageTransition.to : null };\n    }\n    if (RING_SIZE > 0) {\n      if (!Array.isArray(store.intentAudit)) store.intentAudit = [];\n      store.intentAudit.push(record);\n      if (store.intentAudit.length > RING_SIZE) store.intentAudit.splice(0, store.intentAudit.length - RING_SIZE);\n    }\n  } catch (error) { /* static data unavailable in some manual runs */ }\n}\nif (LOG_TO_STDOUT) { try { console.log(`[intent-spike] ${JSON.stringify(record)}`); } catch (error) { /* best effort */ } }\nreturn { json: record };\n"
+      },
+      "id": "86ba3dce-5b66-516d-b68e-ac901dca1d43",
+      "name": "Audit Logger",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4800,
+        300
+      ],
+      "notes": "Redacted record · stdout + ring buffer · cooldown ledger (live only)."
+    },
+    {
+      "parameters": {},
+      "id": "0f258824-0e46-5596-ad4e-6e879f9640bf",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        900
+      ],
+      "notes": "Fires when this workflow is selected as its own Error Workflow."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitized Error Handler              Mode: Run Once for All Items\n// Fed by the Error Trigger when this workflow is its own Error Workflow.\n// Drops stack traces and request options, redacts secrets, and emits a\n// safe alert record (and optionally a minimal Slack notice).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['INTENT_WEBHOOK_SECRET', 'ZOOMINFO_WEBHOOK_TOKEN', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\n\nreturn $input.all().map(({ json }) => {\n  const execution = json.execution || {};\n  const error = execution.error || (json.trigger && json.trigger.error) || {};\n  const alert = {\n    alertType: 'intent_spike_engine_execution_error',\n    at: new Date().toISOString(),\n    workflow: { id: json.workflow ? json.workflow.id : null, name: redactString(json.workflow ? json.workflow.name : '') },\n    execution: { id: execution.id || null, mode: execution.mode || null, retryOf: execution.retryOf || null },\n    lastNodeExecuted: execution.lastNodeExecuted || null,\n    errorName: redactString(error.name || 'Error'),\n    errorMessage: redactString(error.message || 'unknown error').slice(0, 300),\n    nextStep: 'Open the execution in n8n (restricted access) and check the node named in lastNodeExecuted.',\n  };\n  try { console.error(`[intent-spike:error] ${JSON.stringify(alert)}`); } catch (e) { /* best effort */ }\n  const notify = !SANDBOX_MODE && !DRY_RUN && env('SLACK_WEBHOOK_URL', '') !== '' && flag('SLACK_NOTIFY_ON_MONITOR_ERROR', true);\n  return {\n    json: {\n      ...alert,\n      notify,\n      slackMessage: {\n        text: `Intent spike engine failed at ${alert.lastNodeExecuted || 'unknown node'}`,\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: '⚠️ Intent spike engine failed', emoji: true } },\n          { type: 'section', text: { type: 'mrkdwn', text: `*Node:* ${alert.lastNodeExecuted || 'unknown'}\\n*Error:* ${alert.errorName}: ${alert.errorMessage}` } },\n          { type: 'context', elements: [{ type: 'mrkdwn', text: `Execution \\`${alert.execution.id || 'n/a'}\\` · intent surges received while this was failing were not routed; check 6sense or ZoomInfo for recent spikes` }] },\n        ],\n      },\n    },\n  };\n});\n"
+      },
+      "id": "5417a7d0-3c31-5a66-b574-c7fc8cf2c43b",
+      "name": "Sanitized Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d83a85b6-a8a7-50c3-8057-bae6cac4fbfa",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e3e508db-3526-5ad2-8942-7cdc207b6c24",
+      "name": "Notify Execution Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "85103811-4b15-59d6-a619-fbe39b732304",
+      "name": "Post Execution Error Notice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        840
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## n8n-6sense-zoominfo-intent-spike-hubspot-alert-engine\nIntent surges → HubSpot tier match → AE outreach task → Slack alert for tier-1 accounts. dhRobin Systems.\n\n**Safe defaults:** `SANDBOX_MODE=true`, `DRY_RUN=true`. No HubSpot or Slack calls until both are `false`.\n\n**Stage 1** Execute *Intent Webhook Trigger* (7 fictional deliveries, 12 accounts).\n**Stage 2** `SANDBOX_MODE=false`: real HubSpot lookups, writes simulated.\n**Stage 3** `DRY_RUN=false`: tasks and Slack alerts go live.\n\nNeither 6sense nor ZoomInfo signs intent payloads with HMAC. See README.md.",
+        "height": 320,
+        "width": 720,
+        "color": 4
+      },
+      "id": "06eb4a6d-93aa-5408-bf4a-f1250d018c08",
+      "name": "Sticky: Start Here",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Account matching\nDomain → company (tier, target flag, owner) → most recent open deal → open intent tasks. Unknown domains are logged, never created.",
+        "height": 110,
+        "width": 600,
+        "color": 3
+      },
+      "id": "83a691cb-c123-5782-b14c-c26d2c9d68f1",
+      "name": "Sticky: Matching",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1160,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Sanitized error path\nNo stack traces, headers or request bodies. Secrets, tokens and Slack URLs are redacted.",
+        "height": 90,
+        "width": 600,
+        "color": 2
+      },
+      "id": "c0320695-b5ed-5970-b5ee-22628f03c6c1",
+      "name": "Sticky: Errors",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        780
+      ]
+    }
+  ],
+  "connections": {
+    "Intent Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Verify Signature & Normalize Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Signature & Normalize Intent": {
+      "main": [
+        [
+          {
+            "node": "Surge Detected?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Surge Detected?": {
+      "main": [
+        [
+          {
+            "node": "Build Account Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Account Lookup": {
+      "main": [
+        [
+          {
+            "node": "Sandbox HubSpot?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox HubSpot?": {
+      "main": [
+        [
+          {
+            "node": "Simulate HubSpot Lookup (Sandbox)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Search Company by Domain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate HubSpot Lookup (Sandbox)": {
+      "main": [
+        [
+          {
+            "node": "Pick Company & Build Searches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Company by Domain": {
+      "main": [
+        [
+          {
+            "node": "Pick Company & Build Searches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Company & Build Searches": {
+      "main": [
+        [
+          {
+            "node": "Live Account Details?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live Account Details?": {
+      "main": [
+        [
+          {
+            "node": "Search Open Deals",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Resolve Tier, Deal & Owner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Open Deals": {
+      "main": [
+        [
+          {
+            "node": "Search Recent Intent Tasks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Recent Intent Tasks": {
+      "main": [
+        [
+          {
+            "node": "Resolve Tier, Deal & Owner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Tier, Deal & Owner": {
+      "main": [
+        [
+          {
+            "node": "Priority Task Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Priority Task Router": {
+      "main": [
+        [
+          {
+            "node": "Create Task?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Task?": {
+      "main": [
+        [
+          {
+            "node": "Live Writes?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live Writes?": {
+      "main": [
+        [
+          {
+            "node": "Create Outreach Task",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate Task Creation (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Task Creation (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Build Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Outreach Task": {
+      "main": [
+        [
+          {
+            "node": "Capture Task Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Capture Task Result": {
+      "main": [
+        [
+          {
+            "node": "Build Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Post Slack Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Slack Alert?": {
+      "main": [
+        [
+          {
+            "node": "Post Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate Slack Alert (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Confirm Slack Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sanitize Slack Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm Slack Delivery": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Slack Error": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Slack Alert (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Sanitized Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitized Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Notify Execution Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Execution Error?": {
+      "main": [
+        [
+          {
+            "node": "Post Execution Error Notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "pinData": {
+    "Intent Webhook Trigger": [
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-intent-signature": "sha256=e56199aec2173d862f594320171c51fb7d331a053eda40ad4d4086e5de2cc10a",
+            "x-intent-timestamp": "1794960000",
+            "x-intent-delivery-id": "relay-zi-0001",
+            "user-agent": "intent-relay (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "deliveryId": "relay-zi-0001",
+            "source": "zoominfo",
+            "data": [
+              {
+                "id": "zi-intent-5550001-987",
+                "type": "Intent",
+                "attributes": {
+                  "category": "Sales",
+                  "topic": "Revenue Operations",
+                  "signalScore": 92,
+                  "audienceStrength": "A",
+                  "newSignal": true,
+                  "signalDate": "2026-11-16",
+                  "trend": 18,
+                  "recommendedContacts": [],
+                  "company": {
+                    "id": 5550001,
+                    "name": "Northwind Fixture Traders",
+                    "website": "http://www.northwind-fixture.example"
+                  }
+                }
+              },
+              {
+                "id": "zi-intent-5550001-028",
+                "type": "Intent",
+                "attributes": {
+                  "category": "Software",
+                  "topic": "CRM Migration",
+                  "signalScore": 85,
+                  "audienceStrength": "B",
+                  "newSignal": false,
+                  "signalDate": "2026-11-16",
+                  "trend": 20,
+                  "recommendedContacts": [],
+                  "company": {
+                    "id": 5550001,
+                    "name": "Northwind Fixture Traders",
+                    "website": "http://www.northwind-fixture.example"
+                  }
+                }
+              },
+              {
+                "id": "zi-intent-5550001-176",
+                "type": "Intent",
+                "attributes": {
+                  "category": "Sales",
+                  "topic": "Sales Engagement",
+                  "signalScore": 55,
+                  "audienceStrength": "C",
+                  "newSignal": false,
+                  "signalDate": "2026-11-16",
+                  "trend": 4,
+                  "recommendedContacts": [],
+                  "company": {
+                    "id": 5550001,
+                    "name": "Northwind Fixture Traders",
+                    "website": "http://www.northwind-fixture.example"
+                  }
+                }
+              },
+              {
+                "id": "zi-intent-5550007-477",
+                "type": "Intent",
+                "attributes": {
+                  "category": "Software",
+                  "topic": "Data Warehouse",
+                  "signalScore": 71,
+                  "audienceStrength": "C",
+                  "newSignal": false,
+                  "signalDate": "2026-11-16",
+                  "trend": 5,
+                  "recommendedContacts": [],
+                  "company": {
+                    "id": 5550007,
+                    "name": "Litware Fixture Analytics",
+                    "website": "http://www.litware-fixture.example"
+                  }
+                }
+              }
+            ]
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/intent-spike",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT Northwind tier_1 + open deal → HIGH CALL task to deal owner + Slack · Litware below threshold (71, +5)",
+          "sandboxFixtures": {
+            "fallbackOwnerId": "sandbox-owner-sdr-queue",
+            "companies": [
+              {
+                "id": "sandbox-co-9001",
+                "properties": {
+                  "name": "Northwind Fixture Traders",
+                  "domain": "northwind-fixture.example",
+                  "website": "https://www.northwind-fixture.example",
+                  "hs_additional_domains": null,
+                  "hubspot_owner_id": "sandbox-owner-ae-1",
+                  "hs_ideal_customer_profile": "tier_1",
+                  "hs_is_target_account": "true",
+                  "hs_num_open_deals": "1"
+                }
+              },
+              {
+                "id": "sandbox-co-9002",
+                "properties": {
+                  "name": "Contoso Fixture Ltd",
+                  "domain": "contoso-fixture.example",
+                  "website": "https://www.contoso-fixture.example",
+                  "hs_additional_domains": null,
+                  "hubspot_owner_id": "sandbox-owner-ae-3",
+                  "hs_ideal_customer_profile": "tier_2",
+                  "hs_is_target_account": "true",
+                  "hs_num_open_deals": "0"
+                }
+              },
+              {
+                "id": "sandbox-co-9003",
+                "properties": {
+                  "name": "Fabrikam Fixture Inc",
+                  "domain": "fabrikam-fixture.example",
+                  "website": "https://www.fabrikam-fixture.example",
+                  "hs_additional_domains": null,
+                  "hubspot_owner_id": "sandbox-owner-ae-3",
+                  "hs_ideal_customer_profile": "tier_3",
+                  "hs_is_target_account": "true",
+                  "hs_num_open_deals": "0"
+                }
+              },
+              {
+                "id": "sandbox-co-9004",
+                "properties": {
+                  "name": "Adatum Fixture Corp",
+                  "domain": "adatum-fixture.example",
+                  "website": "https://www.adatum-fixture.example",
+                  "hs_additional_domains": null,
+                  "hubspot_owner_id": "sandbox-owner-ae-1",
+                  "hs_ideal_customer_profile": "tier_1",
+                  "hs_is_target_account": "true",
+                  "hs_num_open_deals": "0"
+                }
+              },
+              {
+                "id": "sandbox-co-9005",
+                "properties": {
+                  "name": "Woodgrove Fixture Bank",
+                  "domain": "woodgrove-fixture.example",
+                  "website": "https://www.woodgrove-fixture.example",
+                  "hs_additional_domains": null,
+                  "hubspot_owner_id": null,
+                  "hs_ideal_customer_profile": "tier_1",
+                  "hs_is_target_account": "true",
+                  "hs_num_open_deals": "0"
+                }
+              },
+              {
+                "id": "sandbox-co-9006",
+                "properties": {
+                  "name": "Proseware Fixture Systems",
+                  "domain": "proseware-fixture.example",
+                  "website": "https://www.proseware-fixture.example",
+                  "hs_additional_domains": null,
+                  "hubspot_owner_id": "sandbox-owner-ae-2",
+                  "hs_ideal_customer_profile": null,
+                  "hs_is_target_account": "true",
+                  "hs_num_open_deals": "0"
+                }
+              },
+              {
+                "id": "sandbox-co-9007",
+                "properties": {
+                  "name": "Litware Fixture Analytics",
+                  "domain": "litware-fixture.example",
+                  "website": "https://www.litware-fixture.example",
+                  "hs_additional_domains": null,
+                  "hubspot_owner_id": "sandbox-owner-ae-2",
+                  "hs_ideal_customer_profile": "tier_2",
+                  "hs_is_target_account": "true",
+                  "hs_num_open_deals": "0"
+                }
+              }
+            ],
+            "deals": [
+              {
+                "id": "sandbox-deal-7001",
+                "companyId": "sandbox-co-9001",
+                "properties": {
+                  "dealname": "Northwind Fixture · platform expansion",
+                  "dealstage": "contractsent",
+                  "pipeline": "default",
+                  "amount": "48000",
+                  "closedate": "2026-12-19",
+                  "hubspot_owner_id": "sandbox-owner-ae-2",
+                  "hs_is_closed": "false"
+                }
+              },
+              {
+                "id": "sandbox-deal-7002",
+                "companyId": "sandbox-co-9001",
+                "properties": {
+                  "dealname": "Northwind Fixture · 2025 pilot",
+                  "dealstage": "closedwon",
+                  "pipeline": "default",
+                  "amount": "12000",
+                  "hubspot_owner_id": "sandbox-owner-ae-1",
+                  "hs_is_closed": "true"
+                }
+              }
+            ],
+            "tasks": [
+              {
+                "id": "sandbox-task-8001",
+                "companyId": "sandbox-co-9004",
+                "properties": {
+                  "hs_task_subject": "Intent spike: Adatum Fixture Corp · Account Based Marketing (84)",
+                  "hs_task_status": "NOT_STARTED",
+                  "hubspot_owner_id": "sandbox-owner-ae-1"
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-intent-signature": "sha256=f5e9e9c312021c906336ee1f89979f945ae11c6179f2858910e4c04a465eacd8",
+            "x-intent-timestamp": "1794960000",
+            "x-intent-delivery-id": "relay-6s-0002",
+            "user-agent": "intent-relay (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "deliveryId": "relay-6s-0002",
+            "source": "6sense",
+            "accounts": [
+              {
+                "accountId": "6s-fixture-302",
+                "name": "Contoso Fixture Ltd",
+                "domain": "contoso-fixture.example",
+                "buyingStage": "Decision",
+                "previousBuyingStage": "Consideration",
+                "intentScore": 78,
+                "previousIntentScore": 61,
+                "profileFit": "Strong",
+                "intentKeywords": [
+                  {
+                    "keyword": "revenue intelligence",
+                    "score": 81,
+                    "previousScore": 66
+                  },
+                  {
+                    "keyword": "sales forecasting software",
+                    "score": 74
+                  }
+                ],
+                "updatedAt": "2026-11-16T03:00:00Z"
+              },
+              {
+                "accountId": "6s-fixture-303",
+                "name": "Fabrikam Fixture Inc",
+                "domain": "fabrikam-fixture.example",
+                "buyingStage": "Consideration",
+                "previousBuyingStage": "Awareness",
+                "intentScore": 82,
+                "previousIntentScore": 60,
+                "profileFit": "Moderate",
+                "intentKeywords": [
+                  "pipeline analytics"
+                ],
+                "updatedAt": "2026-11-16T03:00:00Z"
+              },
+              {
+                "accountId": "6s-fixture-304",
+                "name": "Tailspin Fixture Toys",
+                "domain": "tailspin-fixture.example",
+                "buyingStage": "Consideration",
+                "previousBuyingStage": "Awareness",
+                "intentScore": 88,
+                "previousIntentScore": 50,
+                "profileFit": "Weak",
+                "intentKeywords": [
+                  "revenue operations"
+                ],
+                "updatedAt": "2026-11-16T03:00:00Z"
+              }
+            ]
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/intent-spike",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT Contoso tier_2 Consideration→Decision → MEDIUM EMAIL task + Slack · Fabrikam tier_3 log only · Tailspin not in HubSpot, log only"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-zoominfo-token": "sandbox-fictional-zoominfo-verification-value",
+            "user-agent": "ZoomInfo-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "webhookDetails": {
+              "id": "zi-webhook-fixture-03",
+              "title": "Intent surge (fictional)",
+              "objectType": "company",
+              "eventType": "Update"
+            },
+            "data": [
+              {
+                "id": 5550004,
+                "name": "Adatum Fixture Corp",
+                "website": "https://www.adatum-fixture.example/en",
+                "intentSignals": [
+                  {
+                    "topic": "Account Based Marketing",
+                    "category": "Marketing",
+                    "signalScore": 90,
+                    "audienceStrength": "A",
+                    "newSignal": true,
+                    "signalDate": "2026-11-16"
+                  }
+                ]
+              }
+            ]
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/intent-spike",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT ZoomInfo direct (x-zoominfo-token) · Adatum tier_1 · open intent task exists → no new task, Slack only"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-intent-signature": "sha256=658be8a9e6523f0d12f01ebc0da1ee1cad5a3930dcc58f8cfe6c8780bb6e11b6",
+            "x-intent-timestamp": "1794960000",
+            "x-intent-delivery-id": "relay-norm-0004",
+            "user-agent": "intent-relay (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "deliveryId": "relay-norm-0004",
+            "source": "relay",
+            "events": [
+              {
+                "accountName": "Woodgrove Fixture Bank",
+                "domain": "WWW.Woodgrove-Fixture.example",
+                "accountScore": 86,
+                "previousAccountScore": 64,
+                "buyingStage": "Decision",
+                "previousBuyingStage": "Consideration",
+                "topics": [
+                  {
+                    "topic": "Sales Compensation",
+                    "score": 86,
+                    "previousScore": 64
+                  }
+                ],
+                "observedAt": "2026-11-16T04:10:00Z"
+              },
+              {
+                "accountName": "Personal mailbox",
+                "domain": "someone@gmail.com",
+                "topics": [
+                  {
+                    "topic": "CRM Software",
+                    "score": 95,
+                    "isNew": true
+                  }
+                ]
+              },
+              {
+                "accountName": "Northwind Fixture Traders",
+                "domain": "northwind-fixture.example",
+                "topics": [
+                  {
+                    "topic": "Revenue Operations",
+                    "score": 93,
+                    "previousScore": 70
+                  }
+                ]
+              }
+            ]
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/intent-spike",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT Woodgrove tier_1 no owner → fallback owner task + Slack · gmail.com excluded · Northwind repeat → cooldown_active"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-intent-signature": "sha256=f7edb46037c8f689246f1ff9ca44c28662fef7d567a81f98b7d2ea53df4a0427",
+            "x-intent-timestamp": "1794960000",
+            "x-intent-delivery-id": "relay-norm-0005",
+            "user-agent": "intent-relay (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "deliveryId": "relay-norm-0005",
+            "source": "relay",
+            "events": [
+              {
+                "accountName": "Spoofed",
+                "domain": "contoso-fixture.example",
+                "topics": [
+                  {
+                    "topic": "x",
+                    "score": 99,
+                    "isNew": true
+                  }
+                ]
+              }
+            ]
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/intent-spike",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT rejected · signature_mismatch"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-intent-signature": "sha256=e41eb75b4b490f9c819f2d62e80e614e271069aa01399e150e8f7264d7dfd47d",
+            "x-intent-timestamp": "1794960000",
+            "x-intent-delivery-id": "relay-norm-0006",
+            "user-agent": "intent-relay (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "deliveryId": "relay-norm-0006",
+            "source": "6sense",
+            "events": [
+              {
+                "accountName": "Proseware Fixture Systems",
+                "domain": "proseware-fixture.example",
+                "topics": [
+                  {
+                    "topic": "Conversation Intelligence",
+                    "score": 93,
+                    "isNew": true,
+                    "strength": "A"
+                  },
+                  {
+                    "topic": "Revenue Operations",
+                    "score": 77,
+                    "previousScore": 58
+                  }
+                ],
+                "observedAt": "2026-11-16T05:00:00Z"
+              }
+            ]
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/intent-spike",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT Proseware untiered target account → tier_2 · score 93 new (hot) → MEDIUM task + Slack"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-intent-signature": "sha256=3a5208d8d694dde90b85272fc22623d411f3c64f90fa3b02e3c055ae00c1f8dd",
+            "x-intent-timestamp": "1794960000",
+            "x-intent-delivery-id": "relay-bad-0007",
+            "user-agent": "intent-relay (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "deliveryId": "relay-bad-0007",
+            "hello": "world"
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/intent-spike",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT ignored · unrecognised_payload_shape"
+        }
+      }
+    ]
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": false,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "UTC"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "author": "DH Robin (dhRobin Systems)",
+    "license": "MIT"
+  }
+}
