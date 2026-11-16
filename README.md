@@ -44,7 +44,7 @@ I designed this engine to answer four questions for every surge: *Is it real? Is
 
 ## 2. Architecture
 
-![Intent Spike Alert Engine Architecture](https://raw.githubusercontent.com/dhrobinsystems/n8n-6sense-zoominfo-intent-spike-hubspot-alert-engine/main/Intent-Spike-Alert-Engine.png)
+![Intent Spike Alert Engine Architecture](./workflow-overview.png)
 
 ```mermaid
 flowchart TD
